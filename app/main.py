@@ -1,4 +1,7 @@
 from fastapi import FastAPI
+from sqlalchemy import text
+
+from app.database import engine
 
 
 app = FastAPI(
@@ -16,4 +19,14 @@ def health_check():
     return {
         "status": "healthy",
         "service": "secure-service-diagnostics-platform",
+    }
+
+@app.get("/readiness")
+def readiness_check():
+    with engine.connect() as connection:
+        connection.execute(text("SELECT 1"))
+
+    return {
+        "status": "ready",
+        "database": "connected",
     }
