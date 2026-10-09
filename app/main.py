@@ -2,6 +2,7 @@ from fastapi import FastAPI
 from sqlalchemy import text
 
 from app.database import engine
+from app.routers.services import router as services_router
 
 
 app = FastAPI(
@@ -30,3 +31,4 @@ def readiness_check():
         "status": "ready",
         "database": "connected",
     }
+app.include_router(services_router)
