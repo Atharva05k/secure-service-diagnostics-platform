@@ -3,6 +3,7 @@ from sqlalchemy import text
 
 from app.database import engine
 from app.routers.services import router as services_router
+from app.routers.events import router as events_router
 
 
 app = FastAPI(
@@ -32,3 +33,4 @@ def readiness_check():
         "database": "connected",
     }
 app.include_router(services_router)
+app.include_router(events_router)
