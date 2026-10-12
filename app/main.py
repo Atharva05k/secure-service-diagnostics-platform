@@ -4,6 +4,7 @@ from sqlalchemy import text
 from app.database import engine
 from app.routers.services import router as services_router
 from app.routers.events import router as events_router
+from app.routers.incidents import router as incidents_router
 
 
 app = FastAPI(
@@ -34,3 +35,4 @@ def readiness_check():
     }
 app.include_router(services_router)
 app.include_router(events_router)
+app.include_router(incidents_router)
