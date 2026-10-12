@@ -8,11 +8,13 @@ from app.services import (
     list_services,
     get_service_by_id,
 )
+from app.auth import require_api_key
 
 
 router = APIRouter(
     prefix="/services",
     tags=["Services"],
+    dependencies=[Depends(require_api_key)],
 )
 
 

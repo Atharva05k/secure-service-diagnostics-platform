@@ -4,11 +4,12 @@ from sqlalchemy.orm import Session
 from app.database import get_db
 from app.schemas import EventCreate, EventResponse
 from app.event_services import create_diagnostic_event
-
+from app.auth import require_api_key
 
 router = APIRouter(
     prefix="/events",
     tags=["Diagnostic Events"],
+    dependencies=[Depends(require_api_key)],
 )
 
 
