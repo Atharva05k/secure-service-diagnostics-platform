@@ -139,3 +139,52 @@ class Incident(Base):
         DateTime(timezone=True),
         nullable=True,
     )
+
+
+class IncidentAuditLog(Base):
+    __tablename__ = "incident_audit_logs"
+
+    __table_args__ = (
+        CheckConstraint(
+            "action IN ('INCIDENT_CREATED', 'STATUS_CHANGED')",
+            name="ck_incident_audit_action",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(
+        primary_key=True,
+    )
+
+    incident_id: Mapped[int] = mapped_column(
+        ForeignKey("incidents.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+
+    action: Mapped[str] = mapped_column(
+        String(40),
+        nullable=False,
+    )
+
+    previous_status: Mapped[str | None] = mapped_column(
+        String(20),
+        nullable=True,
+    )
+
+    new_status: Mapped[str] = mapped_column(
+        String(20),
+        nullable=False,
+    )
+
+    actor_type: Mapped[str] = mapped_column(
+        String(30),
+        server_default="SHARED_API_KEY",
+        nullable=False,
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+        index=True,
+    )

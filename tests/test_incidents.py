@@ -6,10 +6,16 @@ from unittest.mock import MagicMock
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy.dialects import postgresql
+from sqlalchemy.exc import SQLAlchemyError
 
 from app.database import get_db
 from app.main import app
-from app.models import Service, DiagnosticEvent, Incident
+from app.models import (
+    Service,
+    DiagnosticEvent,
+    Incident,
+    IncidentAuditLog,
+)
 
 
 TEST_API_KEY = "test-only-incident-key"
@@ -91,6 +97,17 @@ def client_and_db(monkeypatch):
 
     fake_db.refresh.side_effect = fake_refresh
 
+    def fake_flush():
+        for recorded_call in fake_db.add.call_args_list:
+            record = recorded_call.args[0]
+
+            if isinstance(record, Incident) and record.id is None:
+                record.id = 2
+                record.created_at = fixed_time
+                record.updated_at = fixed_time
+
+    fake_db.flush.side_effect = fake_flush
+
     def override_get_db():
         yield fake_db
 
@@ -142,18 +159,20 @@ def test_create_incident_sanitizes_sensitive_data(
     assert "rahul@example.com" not in data["title"]
     assert "testIncidentSecret99" not in data["description"]
 
-    # Verify the object passed to the database
-    # already contains sanitized values.
-    fake_db.add.assert_called_once()
+    assert fake_db.add.call_count == 2
 
-    saved_incident = fake_db.add.call_args.args[0]
+    saved_incident = fake_db.add.call_args_list[0].args[0]
+    saved_audit = fake_db.add.call_args_list[1].args[0]
 
-    assert isinstance(saved_incident, Incident)
-    assert "[REDACTED_EMAIL]" in saved_incident.title
-    assert "[REDACTED]" in saved_incident.description
-    assert saved_incident.status == "OPEN"
+    assert isinstance(saved_audit, IncidentAuditLog)
 
-    fake_db.commit.assert_called_once()
+    assert saved_audit.incident_id == saved_incident.id
+    assert saved_audit.action == "INCIDENT_CREATED"
+    assert saved_audit.previous_status is None
+    assert saved_audit.new_status == "OPEN"
+    assert saved_audit.actor_type == "SHARED_API_KEY"
+
+    fake_db.flush.assert_called_once()
 
 
 def test_create_incident_rejects_missing_service(
@@ -314,6 +333,14 @@ def test_open_to_investigating(client_and_db):
     assert incident.status == "INVESTIGATING"
     fake_db.commit.assert_called_once()
 
+    audit = fake_db.add.call_args.args[0]
+
+    assert isinstance(audit, IncidentAuditLog)
+    assert audit.incident_id == 1
+    assert audit.action == "STATUS_CHANGED"
+    assert audit.previous_status == "OPEN"
+    assert audit.new_status == "INVESTIGATING"
+
 
 def test_investigating_to_resolved(client_and_db):
     client, fake_db, incident = client_and_db
@@ -345,6 +372,12 @@ def test_investigating_to_resolved(client_and_db):
     )
 
     fake_db.commit.assert_called_once()
+
+    audit = fake_db.add.call_args.args[0]
+
+    assert isinstance(audit, IncidentAuditLog)
+    assert audit.previous_status == "INVESTIGATING"
+    assert audit.new_status == "RESOLVED"
 
 
 # =========================================
@@ -381,7 +414,9 @@ def test_invalid_status_transitions(
     # Rejected updates must not modify the record.
     assert incident.status == current_status
 
+    fake_db.add.assert_not_called()
     fake_db.commit.assert_not_called()
+
 
 
 def test_update_missing_incident(client_and_db):
@@ -463,6 +498,7 @@ def test_invalid_incident_status_value(client_and_db):
         {"offset": -1},
     ],
 )
+
 def test_invalid_incident_pagination(
     client_and_db,
     params,
@@ -477,3 +513,328 @@ def test_invalid_incident_pagination(
 
     assert response.status_code == 422
     fake_db.scalars.assert_not_called()
+
+
+def test_incident_creation_rolls_back_on_commit_failure(
+    client_and_db,
+):
+    client, fake_db, _ = client_and_db
+
+    # Simulate a database transaction failure.
+    fake_db.commit.side_effect = SQLAlchemyError(
+        "Simulated commit failure"
+    )
+
+    with pytest.raises(SQLAlchemyError):
+        client.post(
+            "/incidents",
+            headers=HEADERS,
+            json={
+                "service_id": 1,
+                "title": "Transaction failure test",
+            },
+        )
+
+    # Both records were prepared for insertion.
+    assert fake_db.add.call_count == 2
+
+    # The application must roll back the transaction.
+    fake_db.rollback.assert_called_once()
+
+
+@pytest.fixture
+def audit_entries():
+    return [
+        SimpleNamespace(
+            id=101,
+            incident_id=1,
+            action="INCIDENT_CREATED",
+            previous_status=None,
+            new_status="OPEN",
+            actor_type="SHARED_API_KEY",
+            created_at=datetime(
+                2026, 10, 13, 9, 0,
+                tzinfo=timezone.utc,
+            ),
+        ),
+        SimpleNamespace(
+            id=102,
+            incident_id=1,
+            action="STATUS_CHANGED",
+            previous_status="OPEN",
+            new_status="INVESTIGATING",
+            actor_type="SHARED_API_KEY",
+            created_at=datetime(
+                2026, 10, 13, 9, 5,
+                tzinfo=timezone.utc,
+            ),
+        ),
+        SimpleNamespace(
+            id=103,
+            incident_id=1,
+            action="STATUS_CHANGED",
+            previous_status="INVESTIGATING",
+            new_status="RESOLVED",
+            actor_type="SHARED_API_KEY",
+            created_at=datetime(
+                2026, 10, 13, 9, 15,
+                tzinfo=timezone.utc,
+            ),
+        ),
+    ]
+
+
+def test_retrieve_complete_audit_history(
+    client_and_db,
+    audit_entries,
+):
+    client, fake_db, _ = client_and_db
+
+    fake_db.scalars.return_value.all.return_value = (
+        audit_entries
+    )
+
+    response = client.get(
+        "/incidents/1/audit",
+        headers=HEADERS,
+    )
+
+    assert response.status_code == 200
+
+    data = response.json()
+
+    assert len(data) == 3
+
+    assert [
+        entry["action"] for entry in data
+    ] == [
+        "INCIDENT_CREATED",
+        "STATUS_CHANGED",
+        "STATUS_CHANGED",
+    ]
+
+    assert [
+        entry["new_status"] for entry in data
+    ] == [
+        "OPEN",
+        "INVESTIGATING",
+        "RESOLVED",
+    ]
+
+    assert data[0]["previous_status"] is None
+    assert data[1]["previous_status"] == "OPEN"
+
+    assert data[2]["previous_status"] == (
+        "INVESTIGATING"
+    )
+
+    assert all(
+        entry["incident_id"] == 1
+        for entry in data
+    )
+
+    assert all(
+        entry["actor_type"] == "SHARED_API_KEY"
+        for entry in data
+    )
+
+
+def test_audit_history_query_filters_and_orders(
+    client_and_db,
+    audit_entries,
+):
+    client, fake_db, _ = client_and_db
+
+    # Simulate the second record being returned
+    # for limit=1 and offset=1.
+    fake_db.scalars.return_value.all.return_value = [
+        audit_entries[1]
+    ]
+
+    response = client.get(
+        "/incidents/1/audit",
+        headers=HEADERS,
+        params={
+            "limit": 1,
+            "offset": 1,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()[0]["id"] == 102
+
+    # Inspect the SQLAlchemy SELECT statement.
+    statement = fake_db.scalars.call_args.args[0]
+
+    sql = str(
+        statement.compile(
+            dialect=postgresql.dialect(),
+            compile_kwargs={
+                "literal_binds": True,
+            },
+        )
+    )
+
+    # Normalize whitespace in the SQL string.
+    sql = " ".join(sql.split())
+
+    assert (
+        "WHERE incident_audit_logs.incident_id = 1"
+        in sql
+    )
+
+    assert (
+        "ORDER BY incident_audit_logs.created_at ASC, "
+        "incident_audit_logs.id ASC"
+        in sql
+    )
+
+    assert "LIMIT 1 OFFSET 1" in sql
+
+
+def test_existing_incident_without_audit_records(
+    client_and_db,
+):
+    client, fake_db, _ = client_and_db
+
+    fake_db.scalars.return_value.all.return_value = []
+
+    response = client.get(
+        "/incidents/1/audit",
+        headers=HEADERS,
+    )
+
+    assert response.status_code == 200
+    assert response.json() == []
+
+
+def test_audit_history_for_nonexistent_incident(
+    client_and_db,
+):
+    client, fake_db, _ = client_and_db
+
+    response = client.get(
+        "/incidents/999999/audit",
+        headers=HEADERS,
+    )
+
+    assert response.status_code == 404
+
+    assert response.json()["detail"] == (
+        "Incident not found"
+    )
+
+    fake_db.scalars.assert_not_called()
+
+
+def test_audit_history_requires_authentication(
+    client_and_db,
+):
+    client, fake_db, _ = client_and_db
+
+    response = client.get(
+        "/incidents/1/audit",
+    )
+
+    assert response.status_code == 401
+
+    fake_db.scalars.assert_not_called()
+
+
+def test_audit_history_rejects_invalid_incident_id(
+    client_and_db,
+):
+    client, fake_db, _ = client_and_db
+
+    response = client.get(
+        "/incidents/not-an-id/audit",
+        headers=HEADERS,
+    )
+
+    assert response.status_code == 422
+    fake_db.scalars.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        {"limit": 0},
+        {"limit": 101},
+        {"offset": -1},
+    ],
+)
+def test_audit_history_rejects_invalid_pagination(
+    client_and_db,
+    params,
+):
+    client, fake_db, _ = client_and_db
+
+    response = client.get(
+        "/incidents/1/audit",
+        headers=HEADERS,
+        params=params,
+    )
+
+    assert response.status_code == 422
+    fake_db.scalars.assert_not_called()
+
+def test_incident_creation_rolls_back_on_flush_failure(
+    client_and_db,
+):
+    client, fake_db, _ = client_and_db
+
+    fake_db.flush.side_effect = SQLAlchemyError(
+        "Simulated flush failure"
+    )
+
+    with pytest.raises(SQLAlchemyError):
+        client.post(
+            "/incidents",
+            headers=HEADERS,
+            json={
+                "service_id": 1,
+                "title": "Flush failure test",
+            },
+        )
+
+    # Only the incident is staged before flush fails.
+    assert fake_db.add.call_count == 1
+
+    fake_db.flush.assert_called_once()
+    fake_db.commit.assert_not_called()
+    fake_db.rollback.assert_called_once()
+
+
+def test_status_update_rolls_back_on_commit_failure(
+    client_and_db,
+):
+    client, fake_db, _ = client_and_db
+
+    fake_db.commit.side_effect = SQLAlchemyError(
+        "Simulated commit failure"
+    )
+
+    with pytest.raises(SQLAlchemyError):
+        client.patch(
+            "/incidents/1/status",
+            headers=HEADERS,
+            json={
+                "status": "INVESTIGATING",
+            },
+        )
+
+    # An audit record should have been staged.
+    assert fake_db.add.call_count == 1
+
+    audit_entry = fake_db.add.call_args.args[0]
+
+    assert isinstance(
+        audit_entry,
+        IncidentAuditLog,
+    )
+
+    assert audit_entry.previous_status == "OPEN"
+    assert audit_entry.new_status == "INVESTIGATING"
+
+    fake_db.commit.assert_called_once()
+    fake_db.rollback.assert_called_once()

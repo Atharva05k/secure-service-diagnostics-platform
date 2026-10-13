@@ -3,7 +3,12 @@ from fastapi import HTTPException, status
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
-from app.models import Service, DiagnosticEvent, Incident
+from app.models import (
+    Service,
+    DiagnosticEvent,
+    Incident,
+    IncidentAuditLog,
+)
 from app.schemas import (
     IncidentCreate,
     IncidentStatusUpdate,
@@ -72,10 +77,28 @@ def create_incident(
     )
 
     # Step 5: Save the incident.
+    # Add the new incident to the session.
     db.add(incident)
 
     try:
+        # Insert the incident without committing yet.
+        # PostgreSQL generates its ID at this point.
+        db.flush()
+
+        # Create the corresponding audit record.
+        audit_entry = IncidentAuditLog(
+            incident_id=incident.id,
+            action="INCIDENT_CREATED",
+            previous_status=None,
+            new_status="OPEN",
+            actor_type="SHARED_API_KEY",
+        )
+
+        db.add(audit_entry)
+
+        # Commit the incident and audit entry together.
         db.commit()
+
     except SQLAlchemyError:
         db.rollback()
         raise
@@ -83,6 +106,7 @@ def create_incident(
     db.refresh(incident)
 
     return incident
+
 
 
 
@@ -153,8 +177,21 @@ def update_incident_status(
         incident.resolved_at = datetime.now(timezone.utc)
 
     # Step 6: Commit the change.
+    # Record the status transition.
+    audit_entry = IncidentAuditLog(
+        incident_id=incident.id,
+        action="STATUS_CHANGED",
+        previous_status=current_status,
+        new_status=requested_status,
+        actor_type="SHARED_API_KEY",
+    )
+
+    db.add(audit_entry)
+
+    # Commit the incident update and audit log together.
     try:
         db.commit()
+
     except SQLAlchemyError:
         db.rollback()
         raise
@@ -162,7 +199,6 @@ def update_incident_status(
     db.refresh(incident)
 
     return incident
-
 
 def get_incident_by_id(
     db: Session,
@@ -178,3 +214,33 @@ def get_incident_by_id(
         )
 
     return incident
+
+
+def list_incident_audit_logs(
+    db: Session,
+    incident_id: int,
+    limit: int,
+    offset: int,
+) -> list[IncidentAuditLog]:
+
+    # Step 1: Verify that the incident exists.
+    get_incident_by_id(db, incident_id)
+
+    # Step 2: Build the audit history query.
+    statement = (
+        select(IncidentAuditLog)
+        .where(
+            IncidentAuditLog.incident_id == incident_id
+        )
+        .order_by(
+            IncidentAuditLog.created_at.asc(),
+            IncidentAuditLog.id.asc(),
+        )
+        .limit(limit)
+        .offset(offset)
+    )
+
+    # Step 3: Execute the query.
+    audit_logs = db.scalars(statement).all()
+
+    return list(audit_logs)

@@ -7,12 +7,14 @@ from app.schemas import (
     IncidentCreate,
     IncidentResponse,
     IncidentStatusUpdate,
+    IncidentAuditResponse,
 )
 from app.incident_services import (
     create_incident,
     list_incidents,
     get_incident_by_id,
     update_incident_status,
+    list_incident_audit_logs,
 )
 
 
@@ -81,4 +83,21 @@ def change_incident_status(
         db=db,
         incident_id=incident_id,
         payload=payload,
+    )
+
+@router.get(
+    "/{incident_id}/audit",
+    response_model=list[IncidentAuditResponse],
+)
+def read_incident_audit_history(
+    incident_id: int,
+    limit: int = Query(default=20, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    db: Session = Depends(get_db),
+):
+    return list_incident_audit_logs(
+        db=db,
+        incident_id=incident_id,
+        limit=limit,
+        offset=offset,
     )

@@ -146,3 +146,22 @@ class IncidentStatusUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     status: IncidentStatus
+
+
+class IncidentAuditAction(str, Enum):
+    INCIDENT_CREATED = "INCIDENT_CREATED"
+    STATUS_CHANGED = "STATUS_CHANGED"
+
+
+class IncidentAuditResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    incident_id: int
+
+    action: IncidentAuditAction
+    previous_status: IncidentStatus | None
+    new_status: IncidentStatus
+
+    actor_type: str
+    created_at: datetime
